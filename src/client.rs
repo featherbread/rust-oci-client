@@ -15,8 +15,7 @@ use oci_spec::image::{Arch, Os};
 use olpc_cjson::CanonicalFormatter;
 use reqwest::header::HeaderMap;
 use reqwest::{NoProxy, Proxy, RequestBuilder, Response, Url};
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{debug, trace, warn};
@@ -85,7 +84,18 @@ pub struct TagResponse {
     /// Repository Name
     pub name: String,
     /// List of existing Tags
+    #[serde(deserialize_with = "null_as_default")]
     pub tags: Vec<String>,
+}
+
+/// Helper to deserialize an empty value from a JSON `null`.
+fn null_as_default<'de, D, T>(d: D) -> std::result::Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    let res = <Option<T>>::deserialize(d)?.unwrap_or_default();
+    Ok(res)
 }
 
 /// Layer descriptor required to pull a layer
@@ -3348,6 +3358,46 @@ mod test {
             .await
             .unwrap();
         assert_eq!(manifest.config.media_type, manifest::WASM_CONFIG_MEDIA_TYPE);
+    }
+
+    #[tokio::test]
+    async fn test_list_all_tags_ghcr_io() {
+        const MAX_TAGS_PER_LIST: usize = 100;
+
+        let reference = Reference::try_from(GHCR_IO_IMAGE).expect("failed to parse reference");
+        let c = Client::default();
+
+        let initial_tags = c
+            .list_tags(
+                &reference,
+                &RegistryAuth::Anonymous,
+                Some(MAX_TAGS_PER_LIST),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            initial_tags.tags.len() < MAX_TAGS_PER_LIST,
+            "failed to list all tags for {GHCR_IO_IMAGE} in a single request"
+        );
+
+        // When listing beyond the last tag in the repository, ghcr.io has been observed to emit a
+        // JSON `null` for the "tags" field rather than an empty array.
+        let empty_tags = c
+            .list_tags(
+                &reference,
+                &RegistryAuth::Anonymous,
+                Some(MAX_TAGS_PER_LIST),
+                initial_tags.tags.last().map(|tag| tag.as_str()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            empty_tags.tags.is_empty(),
+            "listed extraneous tags for {GHCR_IO_IMAGE}"
+        );
     }
 
     #[tokio::test]
